@@ -93,6 +93,7 @@ async function patch(path, body) {
 
 async function runScenario(scenario) {
   const tag = `${scenario.branch}  ${scenario.name}`.padEnd(52);
+  const t0 = Date.now();
 
   try {
     // 1. Create
@@ -112,10 +113,14 @@ async function runScenario(scenario) {
     const outcome = finalStatus(scenario.behavior);
     await patch(`/runs/${run.id}/status`, { status: outcome });
 
+    const durationMs = Date.now() - t0;
     const icon = outcome === 'success' ? '✓' : '✗';
-    console.log(`  ${icon}  ${tag}  ${outcome}`);
+    console.log(`  ${icon}  ${tag}  ${outcome}  (${durationMs}ms)`);
+
+    return { name: scenario.name, branch: scenario.branch, behavior: scenario.behavior, outcome, durationMs };
   } catch (err) {
     console.log(`  !  ${tag}  ERROR: ${err.message}`);
+    return { name: scenario.name, branch: scenario.branch, behavior: scenario.behavior, outcome: 'error', durationMs: Date.now() - t0, error: err.message };
   }
 }
 
@@ -145,18 +150,24 @@ async function main() {
 
   // Fire all scenarios in parallel — this is the interesting part for Honeycomb:
   // concurrent spans in the same trace window, competing for SQLite writes.
-  await Promise.allSettled(SCENARIOS.map(runScenario));
+  const settled = await Promise.allSettled(SCENARIOS.map(runScenario));
+  const results = settled.map((r) => r.value).filter(Boolean);
 
   const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
 
   console.log(`\n  ${'-'.repeat(62)}`);
   console.log(`  Finished in ${elapsed}s\n`);
-  console.log('  Suggested Honeycomb queries:');
-  console.log('    • BREAKDOWN BY branch COUNT — busiest branches');
-  console.log('    • BREAKDOWN BY name WHERE status=failed — flakiest jobs');
-  console.log('    • HEATMAP of duration_ms for PATCH /api/runs/:id/status');
-  console.log('    • P95 latency over time — look for the slow deploy-prod spike');
-  console.log('    • Trace a single run: create → queued → running → result\n');
+
+  // Write results for the analyze-traces job to consume
+  const { writeFileSync } = await import('fs');
+  const summary = {
+    completedAt: new Date().toISOString(),
+    totalScenarios: SCENARIOS.length,
+    elapsedMs: Date.now() - t0,
+    results,
+  };
+  writeFileSync('simulation-results.json', JSON.stringify(summary, null, 2));
+  console.log('  Written simulation-results.json for downstream analysis.\n');
 }
 
 main();

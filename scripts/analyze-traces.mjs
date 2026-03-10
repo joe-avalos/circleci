@@ -2,118 +2,76 @@
  * analyze-traces.mjs
  *
  * Runs after the simulate job in CircleCI:
- *   1. Queries Honeycomb for all spans tagged with this workflow's ID
- *   2. Sends the aggregated results to Claude for analysis
+ *   1. Reads simulation-results.json written by simulate.mjs
+ *   2. Sends the results to Claude for analysis
  *   3. Writes analysis.md — stored as a CircleCI artifact
  *
  * Required env vars (set in CircleCI project settings):
- *   HONEYCOMB_API_KEY   — Honeycomb ingest / API key
  *   ANTHROPIC_API_KEY   — Anthropic API key
- *   CIRCLE_WORKFLOW_ID  — injected automatically by CircleCI
- *   CIRCLE_BUILD_NUM    — injected automatically by CircleCI
- *   CIRCLE_BRANCH       — injected automatically by CircleCI
+ *
+ * Injected automatically by CircleCI:
+ *   CIRCLE_BUILD_NUM, CIRCLE_BRANCH, CIRCLE_WORKFLOW_ID
  */
 
-import { writeFileSync } from 'fs';
+import { readFileSync, writeFileSync } from 'fs';
 
-const HONEYCOMB_ROOT = 'https://api.honeycomb.io';
-const ANTHROPIC_API  = 'https://api.anthropic.com/v1/messages';
-const DATASET        = 'circleci-api';
+const ANTHROPIC_API = 'https://api.anthropic.com/v1/messages';
 
-const HONEYCOMB_KEY  = process.env.HONEYCOMB_API_KEY;
-const ANTHROPIC_KEY  = process.env.ANTHROPIC_API_KEY;
-const WORKFLOW_ID    = process.env.CIRCLE_WORKFLOW_ID;
-const BUILD_NUM      = process.env.CIRCLE_BUILD_NUM;
-const BRANCH         = process.env.CIRCLE_BRANCH ?? 'unknown';
-
-// ---------------------------------------------------------------------------
-// Honeycomb Query API (3-step: create → run → poll)
-// ---------------------------------------------------------------------------
-
-async function honeycombFetch(path, method = 'GET', body = undefined) {
-  const res = await fetch(`${HONEYCOMB_ROOT}${path}`, {
-    method,
-    headers: {
-      'X-Honeycomb-Team': HONEYCOMB_KEY,
-      'Content-Type': 'application/json',
-    },
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Honeycomb ${method} ${path} → ${res.status}: ${text}`);
-  }
-  return res.json();
-}
-
-async function queryHoneycomb() {
-  // 1. Create the query
-  const { id: queryId } = await honeycombFetch(`/1/queries/${DATASET}`, 'POST', {
-    calculations: [
-      { op: 'COUNT' },
-      { op: 'P95',  column: 'duration_ms' },
-      { op: 'MAX',  column: 'duration_ms' },
-      { op: 'AVG',  column: 'duration_ms' },
-    ],
-    filters: [
-      { column: 'circleci.workflow_id', op: '=', value: WORKFLOW_ID },
-    ],
-    breakdowns: ['http.method', 'http.target', 'http.status_code'],
-    time_range: 3600,
-    limit: 100,
-  });
-
-  // 2. Run the query
-  const { id: resultId } = await honeycombFetch(`/1/query_results/${DATASET}`, 'POST', {
-    query_id: queryId,
-    disable_series: false,
-    limit: 100,
-  });
-
-  // 3. Poll until complete (max 30s)
-  for (let i = 0; i < 30; i++) {
-    await new Promise((r) => setTimeout(r, 1000));
-    const result = await honeycombFetch(`/1/query_results/${DATASET}/${resultId}`);
-    if (result.complete) return result.data?.results ?? [];
-  }
-
-  throw new Error('Honeycomb query timed out after 30s');
-}
+const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
+const BUILD_NUM     = process.env.CIRCLE_BUILD_NUM  ?? 'local';
+const BRANCH        = process.env.CIRCLE_BRANCH     ?? 'unknown';
+const WORKFLOW_ID   = process.env.CIRCLE_WORKFLOW_ID ?? 'unknown';
 
 // ---------------------------------------------------------------------------
 // Claude analysis
 // ---------------------------------------------------------------------------
 
-async function analyzeWithClaude(results) {
-  const prompt = `You are an observability engineer reviewing CI pipeline traces.
+async function analyzeWithClaude(summary) {
+  const { results, elapsedMs, totalScenarios } = summary;
+
+  // Compute derived stats to give Claude richer context
+  const succeeded  = results.filter((r) => r.outcome === 'success').length;
+  const failed     = results.filter((r) => r.outcome === 'failed').length;
+  const errored    = results.filter((r) => r.outcome === 'error').length;
+  const durations  = results.map((r) => r.durationMs).sort((a, b) => a - b);
+  const p50        = durations[Math.floor(durations.length * 0.5)];
+  const p95        = durations[Math.floor(durations.length * 0.95)];
+  const slowest    = results.slice().sort((a, b) => b.durationMs - a.durationMs).slice(0, 3);
+  const flaky      = results.filter((r) => r.behavior === 'flaky');
+  const flakyFails = flaky.filter((r) => r.outcome === 'failed').length;
+
+  const prompt = `You are an observability engineer reviewing a CI pipeline simulation run.
 
 Context:
-- Service: circleci-api (NestJS Pipeline Run Simulator)
 - Branch: ${BRANCH}
 - CircleCI build: ${BUILD_NUM}
 - Workflow: ${WORKFLOW_ID}
+- Total scenarios: ${totalScenarios}
+- Wall-clock time: ${(elapsedMs / 1000).toFixed(1)}s
+- Outcomes: ${succeeded} succeeded, ${failed} failed, ${errored} errored
+- Latency: P50 ${p50}ms, P95 ${p95}ms
+- Flaky scenarios: ${flakyFails}/${flaky.length} failed (expected ~45%)
+- 3 slowest runs: ${slowest.map((r) => `${r.name} on ${r.branch} (${r.durationMs}ms, ${r.outcome})`).join(' | ')}
 
-The data below is aggregated from Honeycomb. Each row is a unique combination
-of HTTP method, target endpoint, and status code. Metrics are COUNT, P95/MAX/AVG
-of duration_ms.
-
+Full results:
 ${JSON.stringify(results, null, 2)}
 
 Write a concise analysis in markdown with these sections:
+
 ## Summary
-2-3 sentences on what the simulation did.
+2-3 sentences on what happened overall.
 
 ## Performance
-Call out any latency outliers. Flag P95 > 3000ms as slow.
+Highlight latency outliers. Flag anything with P95 > 5000ms. Compare slow vs fast job types.
 
-## Error Rate
-Non-2xx responses, failed status transitions, anything unexpected.
+## Failures
+Which jobs failed, on which branches, and whether it was expected (flaky) or not.
 
-## Notable Patterns
-Anything interesting about the request distribution.
+## Patterns
+Anything interesting about the distribution — e.g. which branches are most active, which job types are most error-prone.
 
 ## Recommendation
-One concrete, actionable suggestion based on this data.`;
+One concrete, actionable suggestion.`;
 
   const res = await fetch(ANTHROPIC_API, {
     method: 'POST',
@@ -143,22 +101,21 @@ One concrete, actionable suggestion based on this data.`;
 // ---------------------------------------------------------------------------
 
 async function main() {
-  if (!HONEYCOMB_KEY) { console.error('Missing HONEYCOMB_API_KEY'); process.exit(1); }
   if (!ANTHROPIC_KEY) { console.error('Missing ANTHROPIC_API_KEY'); process.exit(1); }
-  if (!WORKFLOW_ID)   { console.error('Missing CIRCLE_WORKFLOW_ID'); process.exit(1); }
 
-  console.log(`Querying Honeycomb for workflow ${WORKFLOW_ID}...`);
-  const results = await queryHoneycomb();
-
-  if (results.length === 0) {
-    console.log('No spans found for this workflow. Check that HONEYCOMB_API_KEY is correct and traces have been exported.');
-    process.exit(0);
+  let summary;
+  try {
+    summary = JSON.parse(readFileSync('simulation-results.json', 'utf8'));
+  } catch {
+    console.error('simulation-results.json not found — did the simulate job run and persist the workspace?');
+    process.exit(1);
   }
 
-  console.log(`Got ${results.length} result rows. Sending to Claude...`);
-  const analysis = await analyzeWithClaude(results);
+  console.log(`Analyzing ${summary.totalScenarios} scenarios from build #${BUILD_NUM}...`);
 
-  const markdown = `# Trace Analysis — Build #${BUILD_NUM}
+  const analysis = await analyzeWithClaude(summary);
+
+  const markdown = `# Simulation Analysis — Build #${BUILD_NUM}
 
 **Branch:** \`${BRANCH}\`
 **Workflow:** \`${WORKFLOW_ID}\`

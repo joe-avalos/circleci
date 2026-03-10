@@ -80,13 +80,19 @@ jobs:
           command: npm run simulate
           environment:
             API_URL: http://localhost:3001/api
+      - persist_to_workspace:
+          root: .
+          paths:
+            - simulation-results.json
 
   analyze-traces:
     executor: node
     steps:
       - checkout
+      - attach_workspace:
+          at: .
       - run:
-          name: Analyze Honeycomb traces with Claude
+          name: Analyze simulation results with Claude
           command: node scripts/analyze-traces.mjs
       - store_artifacts:
           path: analysis.md
