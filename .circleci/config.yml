@@ -81,6 +81,25 @@ jobs:
           environment:
             API_URL: http://localhost:3001/api
 
+  analyze-traces:
+    executor: node
+    steps:
+      - checkout
+      - run:
+          name: Analyze Honeycomb traces with Claude
+          command: node scripts/analyze-traces.mjs
+      - store_artifacts:
+          path: analysis.md
+          destination: trace-analysis
+
+  review-pr:
+    executor: node
+    steps:
+      - checkout
+      - run:
+          name: Review PR with Claude
+          command: node scripts/review-pr.mjs
+
   build:
     executor: node
     steps:
@@ -108,9 +127,13 @@ workflows:
     jobs:
       - test-api
       - test-web
+      - review-pr
       - simulate:
           requires:
             - test-api
+      - analyze-traces:
+          requires:
+            - simulate
       - build:
           requires:
             - test-api
