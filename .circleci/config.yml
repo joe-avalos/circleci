@@ -72,8 +72,6 @@ jobs:
           name: Start API
           command: npm run dev --workspace=apps/api
           background: true
-          environment:
-            HONEYCOMB_API_KEY: $HONEYCOMB_API_KEY
       - run:
           name: Wait for API
           command: npx wait-on tcp:3001 --timeout 60000
@@ -82,7 +80,6 @@ jobs:
           command: npm run simulate
           environment:
             API_URL: http://localhost:3001/api
-            HONEYCOMB_API_KEY: $HONEYCOMB_API_KEY
 
   build:
     executor: node
