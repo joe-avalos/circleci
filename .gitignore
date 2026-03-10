@@ -1,0 +1,16 @@
+node_modules/
+dist/
+.env
+*.local
+
+# Vite
+apps/web/dist/
+
+# NestJS
+apps/api/dist/
+apps/api/data/
+
+# OS
+.DS_Store
+
+study-guides

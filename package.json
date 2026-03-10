@@ -1,0 +1,17 @@
+{
+  "name": "circleci-toyapp",
+  "private": true,
+  "workspaces": [
+    "apps/*"
+  ],
+  "scripts": {
+    "dev": "concurrently -n api,web -c cyan,magenta --kill-others-on-fail \"npm run dev --workspace=apps/api\" \"wait-on tcp:3001 && npm run dev --workspace=apps/web\"",
+    "build": "npm run build --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "simulate": "node scripts/simulate.mjs"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2",
+    "wait-on": "^8.0.1"
+  }
+}
